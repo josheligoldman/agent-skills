@@ -1,0 +1,179 @@
+\documentclass[11pt]{beamer}
+\usetheme{metropolis}
+\usepackage{appendixnumberbeamer}
+\usepackage[T1]{fontenc}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\setbeamertemplate{frame numbering}[fraction]
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{mDarkTeal}\bfseries,
+  commentstyle=\color{gray},
+  stringstyle=\color{mDarkBrown},
+  showstringspaces=false,
+  breaklines=true,
+  columns=fullflexible,
+  language=Python,
+}
+
+\title{Cookiecutter Data Science Conventions}
+\subtitle{How this repo keeps agents honoring project structure}
+\author{Josh Goldman}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{frame}{What we built}
+  Three pieces, working together:
+  \begin{enumerate}
+    \item \textbf{\texttt{CLAUDE-CCDS.md}} --- a conventions file that tells
+      an agent \emph{how to write code} in a ccds-structured repo, day to
+      day (not just at scaffold time): directory layout, config/CLI
+      conventions, \texttt{Protocol}-based design, testing, tooling.
+    \item \textbf{\texttt{new-ds-project} skill} --- scaffolds a
+      \textbf{brand-new} repo into this structure from scratch.
+    \item \textbf{\texttt{refactor-ccds} skill} --- takes an
+      \textbf{existing}, non-ccds repo and reorganizes it into our style,
+      rather than moving files ad hoc.
+  \end{enumerate}
+  \vspace{0.5em}
+  \small The two skills handle one-time setup/migration; the \texttt{.md}
+  file keeps every later change consistent with it.
+\end{frame}
+
+\begin{frame}[fragile]{ccds file structure}
+  \begin{lstlisting}[language=,basicstyle=\ttfamily\scriptsize]
+data/
+    raw/          # immutable, gitignored, never edited in place
+    interim/      # regenerable from raw
+    processed/    # regenerable, model-ready
+notebooks/        # exploration only: <n>.<initials>-<desc>.ipynb
+models/           # serialized trained models
+reports/
+    figures/      # generated charts
+references/       # data dictionaries, explanatory material
+docs/adr/         # architecture decision records
+src/<module_name>/
+    config.py         # paths, env, logging, seeding
+    data/               make_dataset.py, validators.py
+    features/*          base.py, build_features.py
+    modeling/            base.py, train.py, predict.py, architectures.py
+    visualization/        plots.py
+tests/            # mirrors src/<module_name>/, one test file per source file
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{Tools we're using}
+  \begin{columns}[T]
+    \column{0.5\textwidth}
+    \textbf{Config \& CLI}
+    \begin{itemize}
+      \item \texttt{pathlib} + \texttt{config.py}
+      \item \texttt{python-dotenv}
+      \item \texttt{typer} (simple stages)
+      \item \texttt{Tyro} (config-heavy stages)
+      \item \texttt{loguru} + \texttt{tqdm}
+    \end{itemize}
+    \vspace{0.5em}
+    \textbf{Data \& experiments}
+    \begin{itemize}
+      \item \texttt{pandera} (schema validation)
+      \item \texttt{wandb} (run tracking)
+      \item \texttt{Makefile} (orchestration)
+    \end{itemize}
+    \column{0.5\textwidth}
+    \textbf{Quality}
+    \begin{itemize}
+      \item \texttt{ruff} (lint + format)
+      \item \texttt{mypy} (typing)
+      \item \texttt{pytest} (tests)
+      \item \texttt{pre-commit} (blocks commits)
+      \item \texttt{pip-audit} (dependency security)
+    \end{itemize}
+  \end{columns}
+\end{frame}
+
+\begin{frame}[fragile]{Method structure as \texttt{Protocol}s}
+  \small
+  \begin{itemize}
+    \item Each stage's method structure is broken into a
+      \texttt{typing.Protocol} interface with swappable concrete
+      implementations --- decomposed into the \emph{real} sub-parts rather
+      than one interface per stage:
+  \end{itemize}
+\begin{lstlisting}[basicstyle=\ttfamily\scriptsize]
+class FeatureExtractor(Protocol): def transform(self, raw): ...
+class Backbone(Protocol):         def encode(self, features): ...
+class PredictorHead(Protocol):    def forward(self, embedding): ...
+class Model(Protocol):
+    def fit(self, features, labels) -> None: ...
+    def predict(self, features): ...
+\end{lstlisting}
+  \begin{itemize}
+    \item This decomposition also gives us something to
+      \textbf{visualize}: diagram the protocols and their
+      information flow/containment (what calls what, what wraps what) to
+      see a program's high-level structure and building blocks at a
+      glance --- independent of any one implementation's internals.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Style \& workflow --- the small things}
+  \begin{itemize}
+    \item \textbf{Style}: \texttt{ruff} enforces PEP-8-ish formatting +
+      linting, roughly followed rather than dogmatically; NumPy-style
+      docstrings on public functions/classes; comments explain \emph{why},
+      not \emph{what}; no commented-out code or context-free TODOs.
+    \item \textbf{Git/GitHub}:
+      \begin{itemize}
+        \small
+        \item Commit early and often, imperative-mood messages explaining
+          \emph{why}.
+        \item Branch for anything experimental/risky; merge or discard.
+        \item Push regularly --- it's the backup and shareable record.
+        \item Never force-push or rewrite history on \texttt{main}.
+        \item No PR requirement or branch-protection rules by default.
+      \end{itemize}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{How \texttt{refactor-ccds} works}
+  \small
+  Never move files ad hoc --- analyze before touching anything:
+  \begin{enumerate}
+    \item \textbf{Inventory \& analyze} the repo first: classify every
+      file, flag anything that \textbf{doesn't cleanly fit} the standard
+      structure or would need an actual behavior change to move.
+    \item \textbf{Grill session} on that ambiguous set --- resolve every
+      open question with the user before moving a single file.
+    \item \textbf{Prepare a clear plan}: full old $\rightarrow$ new path
+      mapping, deletions, and behavior changes called out explicitly.
+    \item \textbf{Present for approval} --- wait for explicit confirmation
+      before touching the filesystem.
+    \item \textbf{Then refactor}: move on a new branch with \texttt{git mv}
+      (history preserved), fix what broke, check tests against baseline.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Future steps}
+  \begin{itemize}
+    \item Right now, \texttt{CLAUDE-CCDS.md} bakes in \textbf{one fixed}
+      set of style choices (Tyro vs. typer, \texttt{Protocol} decomposition,
+      wandb, \dots) --- the same for every project and every user.
+    \item \textbf{Make it customizable}: turn these choices into
+      preferences instead of hardcoded defaults, so different
+      projects/collaborators can deviate where it makes sense.
+    \item Concretely: a \textbf{skill that interviews the user} about their
+      preferred style (naming, tooling choices, how strict to be about
+      \texttt{Protocol}s, testing rigor, \dots), then
+      \textbf{regenerates/updates} the project's \texttt{CLAUDE.md}
+      conventions from those answers --- rather than everyone hand-editing
+      the same fixed file.
+  \end{itemize}
+\end{frame}
+
+\end{document}
