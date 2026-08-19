@@ -89,7 +89,7 @@ of the plan.
 | Intermediate transformed data | `data/interim/` |
 | Model-ready data | `data/processed/` |
 | `.ipynb` notebooks | `notebooks/`, renamed to `<n>.<initials>-<slug>.ipynb` if not already |
-| Reusable Python modules/scripts | `src/<module_name>/{data,modeling,visualization}/` — one subpackage per pipeline stage (see [CLAUDE-CCDS.md](../../CLAUDE-CCDS.md)'s `src/<module_name>/` layout section for the canonical file split within each: `data/make_dataset.py`+`validators.py`, `modeling/base.py`+`train.py`+`predict.py`+`architectures.py`, `visualization/plots.py`). There is deliberately no `features/` — every project here is representation learning, so feature/embedding code is a `modeling/` component instead. |
+| Reusable Python modules/scripts | `src/<module_name>/{data,modeling,visualization}/` — one subpackage per pipeline stage (see [CLAUDE-CCDS.md](../../CLAUDE-CCDS.md)'s `src/<module_name>/` layout section for the canonical file split within each: `data/make_dataset.py`+`validators.py`, `modeling/base.py`+`module.py`+`data_module.py`+`train.py`+`predict.py`+`architectures.py`, `visualization/plots.py`). There is deliberately no `features/` — every project here is representation learning, so feature/embedding code is a `modeling/` component instead. |
 | Low-level code shared by multiple implementations within one stage (shared layers, utilities used by more than one `Backbone`/`Model`/`Embedder`) | `<stage>/common/` (e.g. `modeling/common/`) — see `CLAUDE-CCDS.md`'s "`common/` for genuinely shared code" note. Don't force-split this across stages just because it's reusable. |
 | Trained model artifacts (`.pkl`, `.joblib`, `.pt`, `.h5`, ...) | `models/` |
 | Output charts/images | `reports/figures/` |
@@ -179,12 +179,15 @@ behavior change but withholding the option isn't the safer choice here:
     already exist.
   - `CITATION.cff` and `docs/adr/` (with the same short explainer used by
     `new-ds-project`) if missing.
-  - A `set_seed()` helper in `config.py` (or wherever paths/env are already
-    centralized) if one doesn't already exist.
   - `modeling/base.py` (`Model` `Protocol` and `Embedder`/`Encoder`
     `Protocol`) and `modeling/architectures.py` (Tyro config dataclasses) if
     the existing modeling code doesn't already follow the
     swappable-implementations pattern.
+  - `modeling/module.py` (a `LightningModule` wrapping a `Model` with loss/
+    optimizer/metrics) and `modeling/data_module.py` (a `LightningDataModule`)
+    if the repo trains with a hand-rolled loop instead of PyTorch Lightning
+    — see `CLAUDE-CCDS.md`'s "Training loop" section. `lightning` joins the
+    dependency list alongside it.
   - `hypothesis` and `pytest-cov` as dev/test dependencies, and `"C901"`
     (McCabe complexity) added to `[tool.ruff.lint]`'s `select` list, if not
     already present — see `CLAUDE-CCDS.md`'s Testing and Code Quality
@@ -201,13 +204,15 @@ behavior change but withholding the option isn't the safer choice here:
     -infrastructure choice for the user to make separately, not something
     this refactor should propose unprompted.
 - **Already present, but conflicting** — a working config system where
-  house convention says Tyro, a different logger/CLI/experiment tracker,
-  a `[tool.mypy]` section with a global `ignore_missing_imports = true`
-  instead of the house per-module-override policy, etc. Always ask, and
-  recommend migrating to the house convention as the default answer — but
-  if the user declines, keep what's there. Either way, record the outcome
-  in the Step 12 report so a "not yet migrated" gap is a visible, tracked
-  decision rather than something nobody notices later.
+  house convention says Tyro, a CLI framework other than `tyro` (e.g.
+  `typer`, `argparse`, `click`), a different logger/experiment tracker, a
+  hand-rolled training loop instead of PyTorch Lightning, a `[tool.mypy]`
+  section with a global `ignore_missing_imports = true` instead of the
+  house per-module-override policy, etc. Always ask, and recommend
+  migrating to the house convention as the default answer — but if the
+  user declines, keep what's there. Either way, record the outcome in the
+  Step 12 report so a "not yet migrated" gap is a visible, tracked decision
+  rather than something nobody notices later.
 
 For anything declined (in either case), note it in the Step 12 report as a
 follow-up rather than silently skipping it.

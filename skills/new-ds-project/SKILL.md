@@ -1,6 +1,6 @@
 ---
 name: new-ds-project
-description: Scaffold a brand-new data science / ML project using the official cookiecutter-data-science (ccds) template as a base, then layer this project's house conventions on top (subpackage-per-stage layout, typer/Tyro, wandb, pandera, pre-commit, CI). Config options are fetched live from upstream every run. Use when the user asks to start a new data science, ML, or research project, wants a repo scaffolded "cookiecutter data science" style, or mentions ccds/cookiecutter-data-science. Refuses on a non-empty target directory — see the refactor-ccds skill for existing repos.
+description: Scaffold a brand-new data science / ML project using the official cookiecutter-data-science (ccds) template as a base, then layer this project's house conventions on top (subpackage-per-stage layout, Tyro, PyTorch Lightning, wandb, pandera, pre-commit, CI). Config options are fetched live from upstream every run. Use when the user asks to start a new data science, ML, or research project, wants a repo scaffolded "cookiecutter data science" style, or mentions ccds/cookiecutter-data-science. Refuses on a non-empty target directory — see the refactor-ccds skill for existing repos.
 ---
 
 # New Data Science Project (ccds + house conventions)
@@ -10,9 +10,10 @@ to plain `cookiecutter` for this template — see
 https://cookiecutter-data-science.drivendata.org/) as a starting point, then
 applies this repo's own conventions on top of the bare upstream scaffold.
 See [CLAUDE-CCDS.md](../../CLAUDE-CCDS.md) for the full rationale behind
-every convention referenced below (subpackage layout, `typer`/Tyro split,
-wandb, pandera, pre-commit, CI, etc.) — this skill file describes *how to
-apply* those conventions during scaffolding, not why they were chosen.
+every convention referenced below (subpackage layout, `tyro`, PyTorch
+Lightning, wandb, pandera, pre-commit, CI, etc.) — this skill file
+describes *how to apply* those conventions during scaffolding, not why
+they were chosen.
 
 Also see [docs/adr/0001-live-schema-sync.md](../../docs/adr/0001-live-schema-sync.md)
 for why the ccds config schema is re-fetched live every run instead of
@@ -142,22 +143,27 @@ into this project's subpackage-per-stage convention:
   feature/embedding computation is always a `modeling/` component instead
   (see `CLAUDE-CCDS.md`).
 - `modeling/` is already a subpackage. Add a `modeling/base.py` stub
-  defining a `Model` `Protocol` (`fit`, `predict`, `save`, `load`) and an
-  `Embedder`/`Encoder` `Protocol` — and a stub `modeling/architectures.py`
-  holding at least two
-  concrete implementations paired with their own Tyro config dataclasses,
-  unioned into one `ModelConfig` (see `CLAUDE-CCDS.md`'s "Swappable
-  implementations" section for the full pattern). **Rewrite `train.py`**
-  to drop its `typer` stub and instead do `config = tyro.cli(ModelConfig)`
-  / `model = config.build()` at the top level — the Model/architectures
+  defining a `Model` `Protocol` (forward-pass only — see `CLAUDE-CCDS.md`'s
+  "Swappable implementations" section) and an `Embedder`/`Encoder`
+  `Protocol` — and a stub `modeling/architectures.py` holding at least two
+  concrete `nn.Module` implementations paired with their own Tyro config
+  dataclasses, unioned into one `ModelConfig`. Add `modeling/module.py`
+  (a `LightningModule` subclass wrapping a `Model` with loss/optimizer/
+  metrics) and `modeling/data_module.py` (a `LightningDataModule` stub for
+  batching/splits) — see `CLAUDE-CCDS.md`'s "Training loop" section for the
+  full pattern. **Rewrite `train.py`** to drop its `typer` stub and instead
+  build `model = config.build()` from `tyro.cli(ModelConfig)`, wrap it in
+  the project's `LightningModule`, build the `LightningDataModule`, and run
+  `Trainer.fit(...)` with a `WandbLogger(log_model="all")` and a
+  `ModelCheckpoint` callback writing to `models/` — the Model/architectures
   pattern is a standing default from project inception, so `train.py` is a
   config-heavy stage from day one, not something to leave as ccds's plain
-  single-path-args stub. Give `ModelConfig`'s union a default variant (e.g.
-  `tyro.cli(ModelConfig, default=RandomForestConfig())`) so bare `make
-  train` still runs without requiring a subcommand choice. `predict.py`
-  stays a plain `typer` stub (loading a model path, an input-data path, and
-  an output path) unless it independently crosses the config-heavy
-  threshold later.
+  single-path-args stub. Give `ModelConfig`'s union a default variant so
+  bare `make train` still runs without requiring a subcommand choice.
+  `predict.py` stays a plain `tyro.cli(main)` stub (loading a checkpoint
+  path, an input-data path, and an output path, then calling
+  `LightningModule.load_from_checkpoint(...)`) unless it independently
+  crosses the config-heavy threshold later.
 - `plots.py` → `visualization/plots.py`; add `visualization/__init__.py`.
   No `base.py` here by default — `visualization/` and `data/` only get a
   `Protocol` interface once a project actually needs to swap
@@ -165,10 +171,9 @@ into this project's subpackage-per-stage convention:
 - Fix any imports that referenced the old flat paths (e.g.
   `<module_name>.dataset` → `<module_name>.data.make_dataset`), including in
   the Makefile (Step 14) and README.
-- In `config.py`, add a `set_seed(seed: int = 42) -> None` helper that seeds
-  `random` and `numpy`, with a comment noting where to also seed the ML
-  framework in use (`torch.manual_seed`, etc.) once one is added. Leave a
-  call to `set_seed()` at the top of `modeling/train.py`'s `main()`.
+- Seeding uses Lightning's own `seed_everything(seed)` — no hand-rolled
+  `set_seed()` helper to add to `config.py`. Call it at the top of
+  `modeling/train.py`'s `main()`, before building the `Model`.
 - **Mirror the new layout under `tests/`.** Upstream `ccds` generates
   `tests/` matching its old flat `src/` layout — restructure it the same
   way `src/<module_name>/` was restructured above (`tests/data/`,
@@ -184,11 +189,13 @@ into this project's subpackage-per-stage convention:
 ## Step 7 — Add house dependencies
 
 Add these to the chosen `dependency_file` on top of whatever `ccds` already
-added for `testing_framework`/`linting_and_formatting`: `tyro`, `wandb`,
-`pandera`, `mypy`, `pre-commit`, `nbstripout`. Add `pip-audit`, `hypothesis`,
-and `pytest-cov` as dev/test-only dependencies (not needed at runtime). If
-the project uses HF Hub (Step 4), also add `datasets` and
-`huggingface_hub`; otherwise leave both out entirely.
+added for `testing_framework`/`linting_and_formatting`: `tyro`, `lightning`,
+`wandb`, `pandera`, `mypy`, `pre-commit`, `nbstripout`. Add `pip-audit`,
+`hypothesis`, and `pytest-cov` as dev/test-only dependencies (not needed at
+runtime). If the project uses HF Hub (Step 4), also add `datasets` and
+`huggingface_hub`; otherwise leave both out entirely. `ccds`'s own scaffold
+adds `typer` by default (its generated stubs import it) — remove it once
+Step 6's rewrite replaces those stubs with `tyro`.
 
 ## Step 8 — Configure `ruff` and `mypy`
 

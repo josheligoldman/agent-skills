@@ -51,8 +51,12 @@ src/<module_name>/
         __init__.py
         base.py            # Model Protocol + Embedder/Encoder Protocol —
                             # see below
-        train.py          # processed data + labels -> trained model artifact
-        predict.py         # trained model + processed data -> predictions
+        module.py          # LightningModule: wraps a Model with loss/
+                            # optimizer/metrics — see "Training loop" below
+        data_module.py      # LightningDataModule: batching/splits/num_workers
+        train.py          # builds Model + LightningModule + DataModule,
+                            # runs Trainer.fit
+        predict.py         # loads a checkpoint, runs inference
         architectures.py   # concrete Model implementations + their Tyro
                             # configs, kept separate from the training loop
     visualization/
@@ -93,31 +97,31 @@ template instead. New code imports these constants; it never hardcodes a
 relative path like `"../data/processed/x.csv"` or assumes a particular
 working directory. `config.py` also configures `loguru` as the project's
 logger (redirected through `tqdm.write()` when `tqdm` is present so progress
-bars don't get mangled by log lines) and should own the `set_seed()` helper
-(seeds Python's `random`, `numpy`, and the ML framework in use) — call it at
-the start of `modeling/train.py` and log the seed value to wandb config. Use
-`logger`, not `print`, in pipeline code.
+bars don't get mangled by log lines). Use `logger`, not `print`, in
+pipeline code. Seeding uses Lightning's own `seed_everything()` (call it at
+the start of `modeling/train.py` and log the seed value to wandb config) —
+it already seeds `random`/`numpy`/`torch` and DataLoader workers
+consistently, so there's no separate hand-rolled `set_seed()` to maintain.
 
-### CLI: `typer` for simple stages, `Tyro` for config-heavy stages
+### CLI: `Tyro`, everywhere, one tool for every stage
 
 Every stage script exposes a CLI entry point guarded by
-`if __name__ == "__main__":`, but the tool depends on the stage's parameter
-count:
+`if __name__ == "__main__":`, always via `tyro`. `tyro` supports two
+shapes, and which one a stage uses depends on its parameter count:
 
 - **Simple stages** (roughly ≤5-6 parameters, no dataset/model variants to
-  swap) use `typer.Typer()` with a single `@app.command()` (conventionally
-  named `main`), parameters typed (`Path`, `int`, `float`, ...) with
-  defaults pointing at `config.py` constants, e.g.
-  `input_path: Path = RAW_DATA_DIR / "dataset.csv"`.
+  swap) call `tyro.cli(main)` directly on a plain, typed function — `tyro`
+  introspects the signature and generates the CLI from it. Parameters are
+  typed (`Path`, `int`, `float`, ...) with defaults pointing at `config.py`
+  constants, e.g. `input_path: Path = RAW_DATA_DIR / "dataset.csv"`.
 - **Config-heavy stages** — typically `modeling/train.py`, and
   `modeling/predict.py` once it crosses that threshold — define a
-  dataclass (or pydantic model) holding their
-  parameters and call `tyro.cli(...)` on it instead of wrapping a typer
-  app. This avoids the CLI-framework conflict that comes from mixing
-  `typer` with Hydra-style config tools, and the dataclass can be logged
-  directly as `wandb.config`. When the stage picks between swappable
-  implementations (see below), the config is a union of per-implementation
-  dataclasses and `tyro` exposes the choice as a CLI subcommand.
+  dataclass (or pydantic model) holding their parameters and call
+  `tyro.cli(...)` on it instead of a plain function. The dataclass can be
+  logged directly as `wandb.config`. When the stage picks between
+  swappable implementations (see below), the config is a union of
+  per-implementation dataclasses and `tyro` exposes the choice as a CLI
+  subcommand.
 - In both cases: narrate progress with `logger.info(...)` at the start of
   meaningful steps and `logger.success(...)` on completion; wrap iteration
   with `tqdm`; keep the entry point as an orchestration layer that calls
@@ -130,40 +134,41 @@ count:
 multiple concrete, swappable implementations from the start — not
 introduced only once a second implementation shows up. Use
 `typing.Protocol` (structural typing), not `abc.ABC`: a `Protocol` lets you
-adapt a third-party class (an sklearn estimator, a pretrained model
-wrapper) as a valid implementation without subclassing anything. Reach for
-`abc.ABC` instead only when implementations should also share concrete
-helper logic through inheritance, not just conform to a method signature.
+adapt a third-party class (a pretrained model wrapper) as a valid
+implementation without subclassing anything. Reach for `abc.ABC` instead
+only when implementations should also share concrete helper logic through
+inheritance, not just conform to a method signature.
+
+`Model` is forward-pass-only — it computes predictions from inputs, full
+stop. Loss, optimizers, and metrics are a separate concern (see "Training
+loop" below), never part of `Model` itself:
 
 `modeling/base.py`:
 
 ```python
-from pathlib import Path
 from typing import Protocol
+from torch import Tensor
 
 class Model(Protocol):
-    def fit(self, features, labels) -> None: ...
-    def predict(self, features): ...
-    def save(self, path: Path) -> None: ...
-    @classmethod
-    def load(cls, path: Path) -> "Model": ...
+    def forward(self, batch) -> Tensor: ...
 ```
 
-`modeling/architectures.py` holds each concrete implementation paired with
-its own Tyro config dataclass, exposed as a `tyro` union/subcommand so the
-implementation is chosen straight from the CLI:
+`modeling/architectures.py` holds each concrete implementation (a real
+`nn.Module` subclass conforming to `Model`) paired with its own Tyro config
+dataclass, exposed as a `tyro` union/subcommand so the implementation is
+chosen straight from the CLI:
 
 ```python
 from dataclasses import dataclass
 from .base import Model
 
 @dataclass
-class RandomForestConfig:
-    n_estimators: int = 100
-    max_depth: int | None = None
+class MLPConfig:
+    hidden_dim: int = 128
+    num_layers: int = 3
 
     def build(self) -> Model:
-        return RandomForestModel(self)
+        return MLPModel(self)
 
 @dataclass
 class GNNConfig:
@@ -173,16 +178,18 @@ class GNNConfig:
     def build(self) -> Model:
         return GNNModel(self)
 
-ModelConfig = RandomForestConfig | GNNConfig
+ModelConfig = MLPConfig | GNNConfig
 ```
 
-`modeling/train.py` then does `config = tyro.cli(ModelConfig)` and
-`model = config.build()`, so `python -m <module_name>.modeling.train
-random-forest --n-estimators 200` and `... gnn --hidden-dim 256` both work
-against the same training loop. The analogous piece for feature/embedding
-computation is an `Embedder`/`Encoder` `Protocol` in `modeling/base.py`
-(raw input -> initial per-entity representation), feeding into the
-backbone the same way.
+`modeling/train.py` does `config = tyro.cli(ModelConfig)` and `model =
+config.build()`, wraps `model` in the project's `LightningModule` (see
+"Training loop" below), and hands that to a `Trainer`. `python -m
+<module_name>.modeling.train mlp --hidden-dim 128` and `... gnn
+--hidden-dim 256` both train through the same `Trainer`/`LightningModule`
+regardless of which concrete `Model` was chosen. The analogous piece for
+feature/embedding computation is an `Embedder`/`Encoder` `Protocol` in
+`modeling/base.py` (raw input -> initial per-entity representation),
+feeding into the backbone the same way.
 
 #### Decompose into the actual swappable sub-parts
 
@@ -201,27 +208,27 @@ class PredictorHead(Protocol):
     def forward(self, embedding): ...
 
 class Model(Protocol):
-    def fit(self, features, labels) -> None: ...
-    def predict(self, features): ...
-    def save(self, path: Path) -> None: ...
-    @classmethod
-    def load(cls, path: Path) -> "Model": ...
+    def forward(self, batch) -> Tensor: ...
 ```
 
-The concrete `Model` is generic over its parts — composed via dependency
-injection, not one hand-written subclass per backbone/head combination:
+Concrete `Backbone`/`PredictorHead`/`Model` implementations are real
+`nn.Module` subclasses (`Protocol` describes the shape structurally; it
+doesn't replace `nn.Module` as the base class parameters need to be
+tracked). The concrete `Model` is generic over its parts — composed via
+dependency injection, not one hand-written subclass per backbone/head
+combination:
 
 ```python
 # modeling/architectures.py
-class ComposedModel:
+class ComposedModel(nn.Module):
     def __init__(self, backbone: Backbone, head: PredictorHead) -> None:
+        super().__init__()
         self.backbone = backbone
         self.head = head
 
-    def fit(self, features, labels) -> None:
-        embedding = self.backbone.encode(features)
-        self.head.fit(embedding, labels)
-    # ...
+    def forward(self, batch) -> Tensor:
+        embedding = self.backbone.encode(batch)
+        return self.head.forward(embedding)
 ```
 
 and the Tyro config mirrors the composition — nested, independently
@@ -290,9 +297,9 @@ shared code anymore, it's another implementation of some `Protocol`.
 - **Keep a model's forward pass separate from training-loop concerns.** A
   `Model` implementation only computes predictions from inputs. Loss
   computation, optimizer/scheduler construction, metric logging, and any
-  scaling/unscaling done purely for reporting belong in a separate
-  training-loop wrapper that holds a `Model` instance — never inside the
-  `Model` itself.
+  scaling/unscaling done purely for reporting belong in the project's
+  `LightningModule` (`modeling/module.py`), which holds a `Model` instance —
+  never inside the `Model` itself. See "Training loop" below.
 - **Avoid logically-coupled optional constructor arguments in the first
   place** — if two optional parameters are related such that one implies
   the other, that's often a sign they belong together in one object or
@@ -317,15 +324,15 @@ step.
 - `data/make_dataset.py` never mutates `data/raw/`; it reads from there and
   writes cleaned output to `data/interim/` or `data/processed/`, validated
   against a `pandera` schema in `data/validators.py`.
-- `modeling/train.py` reads processed data + labels from `data/processed/`,
-  seeds reproducibility via `set_seed()`, logs the run to **wandb**, and
-  writes one serialized artifact both as a wandb Artifact (source of truth
-  for run history/versioning) *and* to `models/` as a plain local file
-  (e.g. `models/latest.pkl`) so `predict.py` and local work don't require
-  network access. Training code doesn't also do plotting.
-- `modeling/predict.py` reads a model from `models/` plus processed data
-  from `data/processed/` and writes predictions to `data/processed/` or
-  `reports/` — it never re-trains.
+- `modeling/train.py` builds a `Model` + `LightningModule` + `LightningDataModule`
+  from `data/processed/`, seeds reproducibility via `seed_everything()`, and
+  runs `Trainer.fit(...)` with a `WandbLogger` (source of truth for run
+  history/versioning) *and* a `ModelCheckpoint` callback writing to
+  `models/` (e.g. `models/latest.ckpt`) so `predict.py` and local work
+  don't require network access. See "Training loop" below.
+- `modeling/predict.py` loads a checkpoint from `models/`, runs inference
+  against processed data from `data/processed/`, and writes predictions to
+  `data/processed/` or `reports/` — it never re-trains.
 - `visualization/plots.py` reads processed data / predictions and writes
   figures to `reports/figures/`; it never touches `data/raw/` or `models/`
   for writing.
@@ -334,6 +341,35 @@ step.
   stage non-reproducible (relies on notebook-only state, an untracked
   global, a manual step), treat that as a bug to fix, not something to
   route around.
+
+### Training loop: PyTorch Lightning
+
+Lightning is the standard training-loop framework — it's the concrete
+mechanism behind "keep a model's forward pass separate from training-loop
+concerns" above, not a per-project choice.
+
+- `modeling/module.py` holds one project-specific `LightningModule`
+  subclass (e.g. `<ModuleName>Module`) wrapping a `Model` instance plus
+  loss, optimizer/scheduler construction (`configure_optimizers`), and
+  metric logging (`training_step`/`validation_step`/`test_step`). It's
+  generic over whichever concrete `Model` was chosen — the same wrapper
+  regardless of `MLPModel` vs `GNNModel`.
+- `modeling/data_module.py` holds a `LightningDataModule` handling splits,
+  batching, `num_workers`, and any collation specific to the model's input
+  representation, built from `data/processed/`.
+- `modeling/train.py` wires these together: `model = config.build()` (from
+  the Tyro `ModelConfig` union) → `module = ProjectModule(model, ...)` →
+  `data_module = ProjectDataModule(...)` → `trainer = Trainer(logger=
+  WandbLogger(log_model="all"), callbacks=[ModelCheckpoint(dirpath=
+  MODELS_DIR)], ...)` → `trainer.fit(module, datamodule=data_module)`.
+- `WandbLogger(log_model=...)` automatically logs checkpoints as wandb
+  Artifacts — this is what satisfies the wandb-Artifact-plus-local-copy
+  dual-write requirement, without hand-rolled upload code.
+  `ModelCheckpoint` writes the local copy `predict.py` reads.
+- `modeling/predict.py` loads a checkpoint via
+  `ProjectModule.load_from_checkpoint(path)` and runs inference directly
+  (or via `Trainer.predict(...)` for a large input set) — it never calls
+  `Trainer.fit`.
 
 ### Publishing the regenerated dataset to HuggingFace Hub
 
@@ -456,8 +492,9 @@ make train ARGS="$*"
 
 Every plain function underlying a stage (not just the CLI wrapper) gets a
 `pytest` test in `tests/`, mirroring the `src/<module_name>/` subpackage
-structure — one test file per source file. Testing the `typer`/`tyro` CLI
-wrapper itself (e.g. via `CliRunner`) is nice-to-have, not required — the
+structure — one test file per source file. Testing the `tyro` CLI wrapper
+itself (e.g. calling `tyro.cli(main, args=[...])` with an explicit args
+list rather than reading `sys.argv`) is nice-to-have, not required — the
 logic worth testing lives in the functions the wrapper calls.
 
 - **Shared fixture builders, not copy-pasted setup.** Put reusable,
